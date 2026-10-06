@@ -3,18 +3,19 @@ import os
 
 import telebot
 from dotenv import load_dotenv
-from telebot import types
+from telebot import apihelper, types
 
 import storage
 from timeweb_api import AuthError, TimewebClient, TimewebError
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.FileHandler(os.path.join(BASE_DIR, "bot.log"), encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
@@ -22,10 +23,15 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 APP_KEY = os.getenv("TIMEWEB_APP_KEY")
+TELEGRAM_API_URL = os.getenv("TELEGRAM_API_URL")
 if not BOT_TOKEN or not APP_KEY:
     raise SystemExit("Заполните BOT_TOKEN и TIMEWEB_APP_KEY в файле .env")
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Если хостинг не пускает к api.telegram.org, запросы идут через прокси
+if TELEGRAM_API_URL:
+    apihelper.API_URL = TELEGRAM_API_URL
+
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 client = TimewebClient(APP_KEY)
 storage.init_db()
 
@@ -34,9 +40,6 @@ BTN_LOGOUT = "🚴‍♂️ Выйти"
 BTN_SITES = "🌍 Сайты"
 BTN_DOMAINS = "🎯 Домены"
 BTN_BALANCE = "💎 Баланс"
-
-# Ожидание ввода логина/пароля: {chat_id: {"step": ..., "login": ...}}
-pending = {}
 
 
 def main_menu():
@@ -107,17 +110,17 @@ def collect_domains(sites):
 
 @bot.message_handler(commands=["start", "help"])
 def handle_start(message):
-    pending.pop(message.chat.id, None)
+    storage.clear_pending(message.chat.id)
     send(
         message.chat.id,
-        "Привет! О каких данных аккаунта вы хотели бы узнать?\n"
+        "Привет! Я показываю данные вашего аккаунта на хостинге Timeweb.\n"
         "Для начала нажмите «" + BTN_AUTH + "».",
     )
 
 
 @bot.message_handler(func=lambda m: m.text == BTN_AUTH)
 def handle_auth_start(message):
-    pending[message.chat.id] = {"step": "login"}
+    storage.set_pending(message.chat.id, "login")
     bot.send_message(
         message.chat.id,
         "Введите логин аккаунта (например, cn12345):",
@@ -127,7 +130,7 @@ def handle_auth_start(message):
 
 @bot.message_handler(func=lambda m: m.text == BTN_LOGOUT)
 def handle_logout(message):
-    pending.pop(message.chat.id, None)
+    storage.clear_pending(message.chat.id)
     storage.delete_user(message.chat.id)
     send(message.chat.id, "Вы вышли из аккаунта.")
 
@@ -171,24 +174,26 @@ def handle_domains(message):
 
 
 @bot.message_handler(
-    func=lambda m: m.chat.id in pending, content_types=["text"]
+    func=lambda m: storage.get_pending(m.chat.id) is not None,
+    content_types=["text"],
 )
 def handle_auth_input(message):
     chat_id = message.chat.id
-    state = pending[chat_id]
+    state = storage.get_pending(chat_id)
+    if state is None:
+        return
+    step, login = state
     text = (message.text or "").strip()
 
-    if state["step"] == "login":
-        state["login"] = text
-        state["step"] = "password"
+    if step == "login":
+        storage.set_pending(chat_id, "password", text)
         bot.send_message(
             chat_id, "Теперь введите пароль. Я сразу удалю это сообщение."
         )
         return
 
     safe_delete(message)
-    login = state["login"]
-    del pending[chat_id]
+    storage.clear_pending(chat_id)
     try:
         token = client.login(login, text)
     except AuthError:
@@ -218,5 +223,7 @@ def handle_other(message):
 
 
 if __name__ == "__main__":
-    logger.info("Бот запущен")
+    # Для локального запуска: webhook и polling несовместимы
+    bot.remove_webhook()
+    logger.info("Бот запущен (polling)")
     bot.infinity_polling()
